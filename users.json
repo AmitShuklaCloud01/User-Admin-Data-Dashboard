@@ -1,0 +1,1 @@
+{"admin": {"password": "240be518fabd2724ddb6f04eeb1da5967448d7e831c08c8fa822809f74c720a9", "role": "admin", "data_access": {"tables": ["rawc_data.rawc_table"], "row_filters": {}}}, "Amit Shukla": {"password": "db2a5bdb1360f38f37de8cccc8814f2d327a0e964afb8bffd6522a06892edd52", "role": "user", "data_access": {"tables": ["rawc_data.rawc_table"], "row_filters": {}}}}
