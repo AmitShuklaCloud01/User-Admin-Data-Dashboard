@@ -154,17 +154,36 @@ def user_data_access_management():
         
         # Row-level filter management
         st.subheader("Row-Level Filters")
-        st.write("Define conditions to filter data for this user (SQL WHERE clause conditions)")
+        st.write("Define conditions to filter data for this user")
+        st.info("""
+        Enter SQL conditions WITHOUT the 'WHERE' keyword. Examples:
+        - column = 'value'
+        - column IN ('value1', 'value2')
+        - numeric_column > 100 
+        - date_column >= '2023-01-01'
+        
+        For multiple conditions, combine with AND/OR:
+        - condition1 AND condition2
+        - (condition1 OR condition2) AND condition3
+        """)
         
         row_filters = {}
         for table in selected_tables:
             current_filter = user_data["data_access"]["row_filters"].get(table, "")
-            filter_condition = st.text_input(
+            # Remove any WHERE keyword that might be in the saved filter
+            if current_filter.upper().startswith("WHERE "):
+                current_filter = current_filter[6:].strip()
+                
+            filter_condition = st.text_area(
                 f"Filter for {table}", 
                 value=current_filter,
-                help="SQL WHERE clause (e.g., 'column = value' or 'column IN (value1, value2)')"
+                help="Enter SQL conditions without the 'WHERE' keyword. Use AND/OR for multiple conditions.",
+                height=100
             )
             if filter_condition:
+                # Make sure the filter doesn't start with WHERE
+                if filter_condition.upper().startswith("WHERE "):
+                    filter_condition = filter_condition[6:].strip()
                 row_filters[table] = filter_condition
         
         # Save changes
@@ -288,7 +307,7 @@ def get_data():
     return get_demo_data(table_to_query)
 
 # Function to get specific table data (for user with multiple table access)
-def get_table_data(table_name):
+def get_table_data(table_name, row_limit=None):
     if client is None:
         st.warning("BigQuery client is not available. Using demo data instead.")
         return get_demo_data(table_name)
@@ -308,8 +327,13 @@ def get_table_data(table_name):
         return get_demo_data(table_name)
     
     try:
-        # Apply row filter if exists
-        row_filter = data_access["row_filters"].get(table_name, "")
+        # Apply row filter if exists - make sure not to include 'WHERE' in the filter itself
+        row_filter = data_access["row_filters"].get(table_name, "").strip()
+        
+        # Remove any "WHERE" keyword that might be in the filter itself
+        if row_filter.upper().startswith("WHERE "):
+            row_filter = row_filter[6:].strip()
+            
         where_clause = f"WHERE {row_filter}" if row_filter else ""
         
         # Split table name into dataset and table
@@ -320,12 +344,25 @@ def get_table_data(table_name):
             
         dataset_id, table_id = parts
         
+        # Default row limit based on user role
+        if row_limit is None:
+            # Admins get all data by default, users get 100 rows
+            row_limit = 0 if st.session_state.role == "admin" else 100
+        
+        # Add LIMIT clause only if row_limit is greater than 0
+        limit_clause = f"LIMIT {row_limit}" if row_limit > 0 else ""
+        
         query = f"""
         SELECT *
         FROM `bigquery-basics-460109.{dataset_id}.{table_id}`
         {where_clause}
-        LIMIT 100
+        {limit_clause}
         """
+        
+        # Log the query for debugging (only visible to admins)
+        if st.session_state.role == "admin":
+            with st.expander("Show SQL Query"):
+                st.code(query, language="sql")
         
         return client.query(query).to_dataframe()
     except NotFound:
@@ -335,13 +372,22 @@ def get_table_data(table_name):
         st.error(f"Query error: {str(e)}")
         # If there's a syntax error in the filter, try without it
         if row_filter:
-            st.warning("Trying query without filters...")
+            st.warning("Filter syntax is invalid. Trying query without filters...")
             try:
+                # Add LIMIT clause only if row_limit is greater than 0
+                limit_clause = f"LIMIT {row_limit}" if row_limit > 0 else ""
+                
                 query = f"""
                 SELECT *
                 FROM `bigquery-basics-460109.{dataset_id}.{table_id}`
-                LIMIT 100
+                {limit_clause}
                 """
+                
+                # Log the query for debugging (only visible to admins)
+                if st.session_state.role == "admin":
+                    with st.expander("Show SQL Query"):
+                        st.code(query, language="sql")
+                        
                 return client.query(query).to_dataframe()
             except Exception as inner_e:
                 st.error(f"Still failed: {str(inner_e)}")
@@ -378,20 +424,60 @@ def user_view():
     # Let user select which table to view
     selected_table = st.selectbox("Select table to view", accessible_tables)
     
+    # Row limit control (default 100 for users)
+    row_limit = st.slider("Maximum rows to display", min_value=10, max_value=1000, value=100, step=10)
+    
     if selected_table:
         st.subheader(f'Data from {selected_table}')
-        df = get_table_data(selected_table)
+        df = get_table_data(selected_table, row_limit=row_limit)
         
         # Check if the result is an error message
         if 'message' in df.columns and len(df.columns) == 1:
             st.warning(df['message'].iloc[0])
         else:
-            st.dataframe(df)
+            # Add interactive filters for the data
+            st.subheader("Filter Data")
+            with st.expander("Show filters", expanded=False):
+                filter_columns = {}
+                
+                # Create filters for each column based on data type
+                for col in df.columns:
+                    if df[col].dtype == 'object':  # Text columns
+                        unique_values = df[col].dropna().unique()
+                        if len(unique_values) < 10:  # Only show multiselect for columns with fewer unique values
+                            filter_columns[col] = st.multiselect(
+                                f"Filter by {col}",
+                                options=unique_values,
+                                default=list(unique_values)
+                            )
+                    elif pd.api.types.is_numeric_dtype(df[col]):  # Numeric columns
+                        min_val = float(df[col].min())
+                        max_val = float(df[col].max())
+                        filter_columns[col] = st.slider(
+                            f"Filter by {col}",
+                            min_val, max_val,
+                            (min_val, max_val)
+                        )
             
-            # Show applied filters if any
+            # Apply filters
+            filtered_df = df.copy()
+            for col, filter_value in filter_columns.items():
+                if filter_value:
+                    if isinstance(filter_value, list):  # For multiselect
+                        if filter_value and len(filter_value) < len(df[col].dropna().unique()):
+                            filtered_df = filtered_df[filtered_df[col].isin(filter_value)]
+                    elif isinstance(filter_value, tuple) and len(filter_value) == 2:  # For sliders
+                        filtered_df = filtered_df[(filtered_df[col] >= filter_value[0]) & 
+                                                 (filtered_df[col] <= filter_value[1])]
+            
+            # Show filtered data
+            st.dataframe(filtered_df)
+            st.write(f"Showing {len(filtered_df)} of {len(df)} records")
+            
+            # Show applied row-level filters if any
             row_filter = data_access["row_filters"].get(selected_table, "")
             if row_filter:
-                st.info(f"Note: Data is filtered with condition: {row_filter}")
+                st.info(f"Note: Data is also filtered with predefined condition: {row_filter}")
 
 # Main dashboard content for admins
 def admin_view():
@@ -419,15 +505,62 @@ def admin_view():
         
         selected_table = st.selectbox("Select table to view", available_tables)
         
+        # Row limit control for admin (default to 0 which means no limit)
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            use_limit = st.checkbox("Limit number of rows", value=False)
+        with col2:
+            row_limit = st.number_input("Maximum rows to display", min_value=10, max_value=10000, value=1000, step=100, disabled=not use_limit)
+        
+        # Calculate actual row limit value
+        actual_row_limit = row_limit if use_limit else 0
+        
         if selected_table:
             st.subheader(f'Data from {selected_table}')
-            df = get_table_data(selected_table)
+            df = get_table_data(selected_table, row_limit=actual_row_limit)
             
             # Check if the result is an error message
             if 'message' in df.columns and len(df.columns) == 1:
                 st.warning(df['message'].iloc[0])
             else:
-                st.dataframe(df)
+                # Add interactive filters for the data
+                st.subheader("Filter Data")
+                with st.expander("Show filters", expanded=False):
+                    filter_columns = {}
+                    
+                    # Create filters for each column based on data type
+                    for col in df.columns:
+                        if df[col].dtype == 'object':  # Text columns
+                            unique_values = df[col].dropna().unique()
+                            if len(unique_values) < 10:  # Only show multiselect for columns with fewer unique values
+                                filter_columns[col] = st.multiselect(
+                                    f"Filter by {col}",
+                                    options=unique_values,
+                                    default=list(unique_values)
+                                )
+                        elif pd.api.types.is_numeric_dtype(df[col]):  # Numeric columns
+                            min_val = float(df[col].min())
+                            max_val = float(df[col].max())
+                            filter_columns[col] = st.slider(
+                                f"Filter by {col}",
+                                min_val, max_val,
+                                (min_val, max_val)
+                            )
+                
+                # Apply filters
+                filtered_df = df.copy()
+                for col, filter_value in filter_columns.items():
+                    if filter_value:
+                        if isinstance(filter_value, list):  # For multiselect
+                            if filter_value and len(filter_value) < len(df[col].dropna().unique()):
+                                filtered_df = filtered_df[filtered_df[col].isin(filter_value)]
+                        elif isinstance(filter_value, tuple) and len(filter_value) == 2:  # For sliders
+                            filtered_df = filtered_df[(filtered_df[col] >= filter_value[0]) & 
+                                                     (filtered_df[col] <= filter_value[1])]
+                
+                # Show filtered data
+                st.dataframe(filtered_df)
+                st.write(f"Showing {len(filtered_df)} of {len(df)} records")
     
     with tab2:
         user_management()
