@@ -1,4 +1,4 @@
-# Cloudphysician Dashboard
+# User-Admin Dashboard
 
 A Streamlit dashboard application for BigQuery data with role-based access control, data access permissions, and comprehensive error handling.
 
